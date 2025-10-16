@@ -9,6 +9,7 @@ options = {
   repos: [],
   start_date: nil,
   end_date: nil,
+  partition: nil,
   verbose: false
 }
 
@@ -27,6 +28,10 @@ OptionParser.new do |opts|
     options[:end_date] = date
   end
 
+  opts.on("--partition PERIOD", ["weekly", "monthly", "yearly"], "Partition commits by period (weekly, monthly, yearly)") do |partition|
+    options[:partition] = partition
+  end
+
   opts.on("--verbose", "Enable verbose logging") do
     options[:verbose] = true
   end
@@ -37,15 +42,74 @@ def log(message, verbose)
   puts "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] #{message}" if verbose
 end
 
+# Date alignment helpers
+def align_to_week_start(date)
+  # Align to Sunday (wday 0)
+  date - date.wday
+end
+
+def align_to_week_end(date)
+  # Align to Saturday (wday 6)
+  date + (6 - date.wday)
+end
+
+def align_to_month_start(date)
+  Date.new(date.year, date.month, 1)
+end
+
+def align_to_month_end(date)
+  Date.new(date.year, date.month, -1)
+end
+
+def align_to_year_start(date)
+  Date.new(date.year, 1, 1)
+end
+
+def align_to_year_end(date)
+  Date.new(date.year, 12, 31)
+end
+
+# Generate partition periods
+def generate_periods(start_date, end_date, partition_type)
+  periods = []
+
+  case partition_type
+  when "weekly"
+    current = start_date
+    while current <= end_date
+      period_end = [current + 6, end_date].min
+      periods << {start: current, end: period_end}
+      current = current + 7
+    end
+  when "monthly"
+    current = start_date
+    while current <= end_date
+      month_end = align_to_month_end(current)
+      period_end = [month_end, end_date].min
+      periods << {start: current, end: period_end}
+      current = month_end + 1
+    end
+  when "yearly"
+    current = start_date
+    while current <= end_date
+      year_end = align_to_year_end(current)
+      period_end = [year_end, end_date].min
+      periods << {start: current, end: period_end}
+      current = year_end + 1
+    end
+  end
+
+  periods
+end
+
 # Validate and parse dates
-start_date_str = nil
-end_date_str = nil
+start_date = nil
+end_date = nil
 
 if options[:start_date]
   begin
-    Date.strptime(options[:start_date], '%Y%m%d')
-    start_date_str = "#{options[:start_date][0..3]}-#{options[:start_date][4..5]}-#{options[:start_date][6..7]}"
-    log("Start date parsed: #{start_date_str}", options[:verbose])
+    start_date = Date.strptime(options[:start_date], '%Y%m%d')
+    log("Start date parsed: #{start_date}", options[:verbose])
   rescue ArgumentError
     puts "Error: Invalid start date format. Expected YYYYMMDD."
     exit 1
@@ -54,14 +118,50 @@ end
 
 if options[:end_date]
   begin
-    Date.strptime(options[:end_date], '%Y%m%d')
-    end_date_str = "#{options[:end_date][0..3]}-#{options[:end_date][4..5]}-#{options[:end_date][6..7]}"
-    log("End date parsed: #{end_date_str}", options[:verbose])
+    end_date = Date.strptime(options[:end_date], '%Y%m%d')
+    log("End date parsed: #{end_date}", options[:verbose])
   rescue ArgumentError
     puts "Error: Invalid end date format. Expected YYYYMMDD."
     exit 1
   end
+else
+  # Default to tomorrow if no end date provided
+  end_date = Date.today + 1
+  log("No end date provided, using tomorrow: #{end_date}", options[:verbose])
 end
+
+# Apply alignment if partitioning is enabled
+if options[:partition]
+  case options[:partition]
+  when "weekly"
+    original_start = start_date
+    original_end = end_date
+    start_date = align_to_week_start(start_date) if start_date
+    end_date = align_to_week_end(end_date)
+    log("Aligned to week: #{original_start} -> #{start_date}, #{original_end} -> #{end_date}", options[:verbose])
+  when "monthly"
+    original_start = start_date
+    original_end = end_date
+    start_date = align_to_month_start(start_date) if start_date
+    end_date = align_to_month_end(end_date)
+    log("Aligned to month: #{original_start} -> #{start_date}, #{original_end} -> #{end_date}", options[:verbose])
+  when "yearly"
+    original_start = start_date
+    original_end = end_date
+    start_date = align_to_year_start(start_date) if start_date
+    end_date = align_to_year_end(end_date)
+    log("Aligned to year: #{original_start} -> #{start_date}, #{original_end} -> #{end_date}", options[:verbose])
+  end
+end
+
+# Generate periods if partitioning
+periods = if options[:partition]
+  generate_periods(start_date, end_date, options[:partition])
+else
+  [{start: start_date, end: end_date}]
+end
+
+log("Generated #{periods.length} period(s)", options[:verbose])
 
 # Create scratch directory
 scratch_dir = 'scratch'
@@ -106,39 +206,64 @@ options[:repos].each do |repo_url|
     log("Successfully cloned repository", options[:verbose])
   end
 
-  # Count commits in date range
+  # Count commits for each period
   if Dir.exist?(repo_path)
-    Dir.chdir(repo_path) do
-      # Build git log command
-      git_cmd = "git log --all --oneline"
+    results[repo_url] = []
 
-      if start_date_str
-        git_cmd += " --after='#{start_date_str} 00:00:00'"
-      end
+    periods.each do |period|
+      Dir.chdir(repo_path) do
+        # Build git log command
+        git_cmd = "git log --all --oneline"
 
-      if end_date_str
-        git_cmd += " --before='#{end_date_str} 23:59:59'"
-      end
+        if period[:start]
+          git_cmd += " --after='#{period[:start].strftime('%Y-%m-%d')} 00:00:00'"
+        end
 
-      log("Running: #{git_cmd}", options[:verbose])
-      commit_output = `#{git_cmd} 2>&1`
+        if period[:end]
+          git_cmd += " --before='#{period[:end].strftime('%Y-%m-%d')} 23:59:59'"
+        end
 
-      if $?.success?
-        commit_count = commit_output.lines.count
-        results[repo_url] = commit_count
-        log("Found #{commit_count} commits", options[:verbose])
-      else
-        puts "Error counting commits for #{repo_url}: #{commit_output}"
-        results[repo_url] = 0
+        log("Running: #{git_cmd}", options[:verbose])
+        commit_output = `#{git_cmd} 2>&1`
+
+        if $?.success?
+          commit_count = commit_output.lines.count
+          results[repo_url] << commit_count
+          log("Found #{commit_count} commits for period #{period[:start]} to #{period[:end]}", options[:verbose])
+        else
+          puts "Error counting commits for #{repo_url}: #{commit_output}"
+          results[repo_url] << 0
+        end
       end
     end
   else
-    results[repo_url] = 0
+    results[repo_url] = [0] * periods.length
   end
 end
 
 # Output CSV summary
-puts "\nRepository,Commits"
-results.each do |repo, count|
-  puts "#{repo},#{count}"
+header = ["Repository"]
+periods.each do |period|
+  header << period[:start].strftime('%Y%m%d')
 end
+header << "Total"
+
+puts header.join(',')
+
+results.each do |repo, counts|
+  total = counts.sum
+  row = [repo] + counts + [total]
+  puts row.join(',')
+end
+
+# Calculate and output column sums
+column_sums = Array.new(periods.length, 0)
+results.each do |repo, counts|
+  counts.each_with_index do |count, index|
+    column_sums[index] += count
+  end
+end
+
+grand_total = column_sums.sum
+sum_row = ["TOTAL"] + column_sums + [grand_total]
+puts sum_row.join(',')
