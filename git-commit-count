@@ -1,0 +1,144 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'fileutils'
+require 'date'
+
+# Parse command line arguments
+options = {
+  repos: [],
+  start_date: nil,
+  end_date: nil,
+  verbose: false
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: git-commit-count [options]"
+
+  opts.on("--repo URL", "GitHub repository URL (can be specified multiple times)") do |repo|
+    options[:repos] << repo
+  end
+
+  opts.on("--start DATE", "Start date in YYYYMMDD format (inclusive)") do |date|
+    options[:start_date] = date
+  end
+
+  opts.on("--end DATE", "End date in YYYYMMDD format (inclusive)") do |date|
+    options[:end_date] = date
+  end
+
+  opts.on("--verbose", "Enable verbose logging") do
+    options[:verbose] = true
+  end
+end.parse!
+
+# Logging helper
+def log(message, verbose)
+  puts "[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] #{message}" if verbose
+end
+
+# Validate and parse dates
+start_date_str = nil
+end_date_str = nil
+
+if options[:start_date]
+  begin
+    Date.strptime(options[:start_date], '%Y%m%d')
+    start_date_str = "#{options[:start_date][0..3]}-#{options[:start_date][4..5]}-#{options[:start_date][6..7]}"
+    log("Start date parsed: #{start_date_str}", options[:verbose])
+  rescue ArgumentError
+    puts "Error: Invalid start date format. Expected YYYYMMDD."
+    exit 1
+  end
+end
+
+if options[:end_date]
+  begin
+    Date.strptime(options[:end_date], '%Y%m%d')
+    end_date_str = "#{options[:end_date][0..3]}-#{options[:end_date][4..5]}-#{options[:end_date][6..7]}"
+    log("End date parsed: #{end_date_str}", options[:verbose])
+  rescue ArgumentError
+    puts "Error: Invalid end date format. Expected YYYYMMDD."
+    exit 1
+  end
+end
+
+# Create scratch directory
+scratch_dir = 'scratch'
+FileUtils.mkdir_p(scratch_dir)
+log("Created/verified scratch directory: #{scratch_dir}", options[:verbose])
+
+# Process each repository
+results = {}
+
+options[:repos].each do |repo_url|
+  log("Processing repository: #{repo_url}", options[:verbose])
+
+  # Extract repo name from URL
+  repo_name = repo_url.split('/').last.gsub('.git', '')
+  repo_path = File.join(scratch_dir, repo_name)
+
+  # Clone or pull repository
+  if Dir.exist?(repo_path)
+    log("Repository already exists, pulling latest changes: #{repo_path}", options[:verbose])
+    Dir.chdir(repo_path) do
+      pull_output = `git pull origin main 2>&1`
+      if $?.success?
+        log("Successfully pulled latest changes", options[:verbose])
+      else
+        # Try 'master' if 'main' fails
+        pull_output = `git pull origin master 2>&1`
+        if $?.success?
+          log("Successfully pulled latest changes from master", options[:verbose])
+        else
+          puts "Error pulling repository #{repo_url}: #{pull_output}"
+          next
+        end
+      end
+    end
+  else
+    log("Cloning repository: #{repo_url}", options[:verbose])
+    clone_output = `git clone #{repo_url} #{repo_path} 2>&1`
+    if !$?.success?
+      puts "Error cloning repository #{repo_url}: #{clone_output}"
+      next
+    end
+    log("Successfully cloned repository", options[:verbose])
+  end
+
+  # Count commits in date range
+  if Dir.exist?(repo_path)
+    Dir.chdir(repo_path) do
+      # Build git log command
+      git_cmd = "git log --all --oneline"
+
+      if start_date_str
+        git_cmd += " --after='#{start_date_str} 00:00:00'"
+      end
+
+      if end_date_str
+        git_cmd += " --before='#{end_date_str} 23:59:59'"
+      end
+
+      log("Running: #{git_cmd}", options[:verbose])
+      commit_output = `#{git_cmd} 2>&1`
+
+      if $?.success?
+        commit_count = commit_output.lines.count
+        results[repo_url] = commit_count
+        log("Found #{commit_count} commits", options[:verbose])
+      else
+        puts "Error counting commits for #{repo_url}: #{commit_output}"
+        results[repo_url] = 0
+      end
+    end
+  else
+    results[repo_url] = 0
+  end
+end
+
+# Output CSV summary
+puts "\nRepository,Commits"
+results.each do |repo, count|
+  puts "#{repo},#{count}"
+end
